@@ -138,16 +138,20 @@ class SimInLoopTrainer:
         self.masses = rhos * volumes
 
         controls = dataset.controls
-        gravity = torch.as_tensor(controls['gravity'], device=points.device, dtype=points.dtype)
         pin_axis = int(controls['pin_axis'])
         pin_threshold = float(controls['pin_threshold'])
         pinned = torch.nonzero(points[:, pin_axis] >= pin_threshold, as_tuple=False).squeeze(1)
         if pinned.numel() == 0:
             raise ValueError('no quadrature point satisfies the pin predicate; raise num_qp')
-        self.pt_forces = [forces.Gravity(gravity, rhos, volumes),
-                          forces.Boundary(pinned, points[pinned].clone(),
-                                          self.config.bdry_penalty)]
         self.num_pinned = int(pinned.numel())
+
+        # The material and the pin predicate are shared across the dataset (TrajectoryDataset
+        # enforces that), so scenarios differ only in their load: one Gravity each, one shared
+        # Boundary, and one shared assembly of B, dF/dz and B^T M B.
+        boundary = forces.Boundary(pinned, points[pinned].clone(), self.config.bdry_penalty)
+        self.scenario_forces = [[forces.Gravity(dataset.gravity_at(index), rhos, volumes), boundary]
+                                for index in range(dataset.num_trajectories)]
+        self.pt_forces = self.scenario_forces[0]
 
         self.node_masses = dataset.nodal_volumes * float(controls['density'])
         self.optimizer = torch.optim.Adam(skinning_mod.parameters(), lr=self.config.learning_rate)
@@ -177,6 +181,10 @@ class SimInLoopTrainer:
     def predict(self, window, model=None, decoder=None):
         r"""Roll the reduced model out over a window and decode it at the full-order nodes.
 
+        The window's scenario decides the load: a prebuilt ``model`` is rebound to that scenario's
+        forces, which shares its assembly and its autograd history, so one ``build()`` serves every
+        scenario in the dataset.
+
         Args:
             window (TrajectoryWindow): The window to predict.
             model (ReducedModel, optional): Prebuilt model. Default: None (build one).
@@ -188,6 +196,14 @@ class SimInLoopTrainer:
         """
         if model is None or decoder is None:
             model, decoder = self.build()
+        if window.trajectory_index >= len(self.scenario_forces):
+            raise IndexError(
+                f'window belongs to scenario {window.trajectory_index} but this trainer was built '
+                f'for {len(self.scenario_forces)} scenario(s). A trainer resolves its loads, '
+                f'quadrature and masses from the dataset it was constructed with; to evaluate the '
+                f'same field on a different scenario set, build a trainer on that dataset and load '
+                f'the state dict into it.')
+        model = model.with_pt_forces(self.scenario_forces[window.trajectory_index])
         coords, velocity = window.initial_reduced_state(decoder.lbs, self.node_masses)
         coords_traj, _ = rollout(model, self.timestep, window.horizon,
                                  reduced_coords=coords, reduced_velocity=velocity,
@@ -225,6 +241,7 @@ class SimInLoopTrainer:
 
         terms['start_frame'] = window.start_frame
         terms['horizon'] = window.horizon
+        terms['trajectory_index'] = window.trajectory_index
         return loss, terms
 
     def train_step(self, window):
@@ -251,17 +268,21 @@ class SimInLoopTrainer:
         return terms
 
     @torch.no_grad()
-    def evaluate(self, window):
+    def evaluate(self, window, model=None, decoder=None):
         r"""Rollout error on a window, reported next to the projection floor.
 
         Args:
             window (TrajectoryWindow): Usually a held-out window.
+            model (ReducedModel, optional): Prebuilt model, rebound to the window's scenario.
+                Default: None (build one).
+            decoder (SkinningDecoder, optional): Prebuilt decoder. Default: None.
 
         Returns:
             dict: ``rollout_mean``, ``rollout_max``, ``projection_mean``, ``projection_max`` (all
             per-vertex distances in :math:`m`) and ``target_max`` for scale.
         """
-        model, decoder = self.build()
+        if model is None or decoder is None:
+            model, decoder = self.build()
         predicted = self.predict(window, model, decoder)
         distances = per_vertex_l2_error(predicted, window.target_positions)
 
@@ -279,24 +300,67 @@ class SimInLoopTrainer:
             'target_max': float(displacements.norm(dim=-1).max()),
         }
 
+    @torch.no_grad()
+    def evaluate_all(self, horizon=None):
+        r"""Held-out rollout error on *every* scenario, aggregated.
+
+        With a pool of load cases the single-scenario number is no longer the right summary: a
+        field can look good on the mean while failing badly on one load. ``worst_rollout_mean``
+        and ``worst_scenario`` are reported for exactly that reason.
+
+        One assembly serves all scenarios, so this costs one network evaluation plus one rollout
+        per scenario.
+
+        Args:
+            horizon (int, optional): Frames to predict per scenario. Default: everything after
+                each split.
+
+        Returns:
+            dict: The mean over scenarios of :meth:`evaluate`'s keys, plus ``worst_rollout_mean``,
+            ``worst_scenario``, ``num_scenarios`` and ``per_scenario`` (the individual dicts).
+        """
+        model, decoder = self.build()
+        records = [self.evaluate(window, model, decoder)
+                   for window in self.dataset.all_eval_windows(horizon)]
+
+        worst = max(range(len(records)), key=lambda i: records[i]['rollout_mean'])
+        summary = {
+            'rollout_mean': sum(r['rollout_mean'] for r in records) / len(records),
+            'rollout_max': max(r['rollout_max'] for r in records),
+            'projection_mean': sum(r['projection_mean'] for r in records) / len(records),
+            'projection_max': max(r['projection_max'] for r in records),
+            'target_max': max(r['target_max'] for r in records),
+            'worst_rollout_mean': records[worst]['rollout_mean'],
+            'worst_scenario': worst,
+            'num_scenarios': len(records),
+        }
+        summary['per_scenario'] = records
+        return summary
+
     def pretrain_projection(self, num_steps, horizon=None, log_every=25, verbose=True):
         r"""Fit the basis to full-order snapshots before any rollout, as an initializer.
 
-        Minimizes the mass-weighted best-projection error over the training frames. Much cheaper
-        per step than a rollout, and it gives the trajectory loss a basis that can at least
-        *represent* the motion before being asked to reproduce its dynamics.
+        Minimizes the mass-weighted best-projection error over the training frames of *every*
+        scenario. Much cheaper per step than a rollout, and it gives the trajectory loss a basis
+        that can at least *represent* the motion before being asked to reproduce its dynamics.
 
         Args:
             num_steps (int): Optimizer steps.
-            horizon (int, optional): Frames to fit. Default: the whole training range.
+            horizon (int, optional): Frames to fit per scenario. Default: each scenario's whole
+                training range.
             log_every (int, optional): Logging interval. Default: 25.
             verbose (bool, optional): Print progress. Default: True.
 
         Returns:
             list of dict: Per-log-step records.
         """
-        window = self.dataset.window(horizon or self.dataset.split_frame(), 0)
-        displacements = window.target_positions - self.dataset.rest_positions
+        if horizon is None:
+            displacements = self.dataset.train_snapshots()
+        else:
+            rest = self.dataset.rest_positions
+            displacements = torch.cat(
+                [self.dataset.window(horizon, 0, index).target_positions - rest
+                 for index in range(self.dataset.num_trajectories)], dim=0)
         records = []
 
         for step in range(num_steps):
@@ -378,8 +442,9 @@ class SimInLoopTrainer:
             if step % log_every == 0 or step == num_steps - 1:
                 record = {'step': step, 'loss': float(loss), 'elastic': float(elastic),
                           'ortho': float(ortho), 'interp': interp}
-                metrics = self.evaluate(self.dataset.eval_window(eval_horizon))
-                record.update({f'eval_{k}': v for k, v in metrics.items()})
+                metrics = self.evaluate_all(eval_horizon)
+                record.update({f'eval_{k}': v for k, v in metrics.items()
+                               if k != 'per_scenario'})
                 records.append(record)
                 if verbose:
                     print(f"  data-free {step:5d}  loss {record['loss']:.6e}  "
@@ -388,9 +453,20 @@ class SimInLoopTrainer:
                           f"{metrics['rollout_mean']:.4e} m")
         return records
 
+    def _window_order(self, num_windows, shuffle):
+        """Visiting order for one epoch over the window pool."""
+        if not shuffle:
+            return list(range(num_windows))
+        return torch.randperm(num_windows).tolist()
+
     def train(self, num_steps, horizon=4, horizon_schedule=None, stride=1, log_every=10,
-              eval_every=50, verbose=True):
-        r"""The training loop, cycling over training-range windows.
+              eval_every=50, shuffle=True, verbose=True):
+        r"""The training loop, cycling over training-range windows from every scenario.
+
+        Windows are pooled across the dataset's trajectories and visited in a shuffled order that
+        is redrawn each epoch. Shuffling matters once there is more than one scenario: visiting the
+        pool in scenario order means every consecutive run of steps sees a single load, and Adam
+        tracks that load's gradient statistics rather than the pool's.
 
         Args:
             num_steps (int): Optimizer steps.
@@ -402,40 +478,49 @@ class SimInLoopTrainer:
             stride (int, optional): Stride between window starts. Default: 1.
             log_every (int, optional): Logging interval. Default: 10.
             eval_every (int, optional): Held-out evaluation interval. Default: 50.
+            shuffle (bool, optional): Shuffle the window pool each epoch. Default: True.
             verbose (bool, optional): Print progress. Default: True.
 
         Returns:
             list of dict: The training history.
         """
         schedule = sorted(horizon_schedule or [], key=lambda item: item[0])
-        windows = self.dataset.train_windows(horizon, stride=stride)
+        windows = self.dataset.all_train_windows(horizon, stride=stride)
+        order = self._window_order(len(windows), shuffle)
         start = time.time()
 
         for step in range(num_steps):
             for threshold, new_horizon in schedule:
                 if step == threshold and new_horizon != horizon:
                     horizon = new_horizon
-                    windows = self.dataset.train_windows(horizon, stride=stride)
+                    windows = self.dataset.all_train_windows(horizon, stride=stride)
+                    order = self._window_order(len(windows), shuffle)
                     if verbose:
                         print(f'  step {step}: horizon -> {horizon} ({len(windows)} windows)')
 
-            record = self.train_step(windows[step % len(windows)])
+            position = step % len(windows)
+            if position == 0 and step > 0:
+                order = self._window_order(len(windows), shuffle)
+            record = self.train_step(windows[order[position]])
             record['step'] = step
             record['elapsed'] = time.time() - start
 
             if verbose and (step % log_every == 0 or step == num_steps - 1):
                 print(f"  step {step:5d}  loss {record['loss']:.6e}  "
                       f"pos {record['position']:.6e}  |g| {record['grad_norm']:.3e}  "
-                      f"h={record['horizon']} t0={record['start_frame']}")
+                      f"h={record['horizon']} s={record['trajectory_index']} "
+                      f"t0={record['start_frame']}")
 
             if eval_every > 0 and (step % eval_every == 0 or step == num_steps - 1):
-                metrics = self.evaluate(self.dataset.eval_window(horizon))
-                record.update({f'eval_{k}': v for k, v in metrics.items()})
+                metrics = self.evaluate_all(horizon)
+                record.update({f'eval_{k}': v for k, v in metrics.items()
+                               if k != 'per_scenario'})
                 if verbose:
                     print(f"    held-out rollout mean {metrics['rollout_mean']:.4e} m  "
-                          f"max {metrics['rollout_max']:.4e} m  |  projection floor mean "
-                          f"{metrics['projection_mean']:.4e} m  |  motion scale "
-                          f"{metrics['target_max']:.4e} m")
+                          f"max {metrics['rollout_max']:.4e} m  |  worst scenario "
+                          f"{metrics['worst_scenario']} at {metrics['worst_rollout_mean']:.4e} m  "
+                          f"|  projection floor mean {metrics['projection_mean']:.4e} m  |  "
+                          f"motion scale {metrics['target_max']:.4e} m")
 
             self.history.append(record)
         return self.history
@@ -465,12 +550,29 @@ def _ensure_beam_data(resolution, frames, device, dtype, verbose=True):
     return trajectory
 
 
+def _ensure_scenario_data(num_directions, magnitudes, resolution, frames, device, dtype,
+                          verbose=True):
+    """Load (generating if needed) a gravity-sweep scenario set as a list of trajectories."""
+    from .data_gen.gen_fom_beam import (generate_scenario_set, gravity_sweep_scenarios,
+                                        load_trajectory)
+
+    scenarios = gravity_sweep_scenarios(num_directions, magnitudes)
+    paths = generate_scenario_set(scenarios, num_frames=frames, resolution=resolution,
+                                  device=device, dtype=dtype, verbose=verbose)
+    return [load_trajectory(path) for path in paths]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--beam', action='store_true', help='use the cantilever-beam scenario')
     parser.add_argument('--resolution', type=int, nargs=3, default=[10, 3, 3],
                         help='full-order grid resolution')
     parser.add_argument('--frames', type=int, default=40, help='frames in the full-order data')
+    parser.add_argument('--scenarios', type=int, default=0,
+                        help='train on a gravity-direction sweep of this many directions instead '
+                             'of the single default load')
+    parser.add_argument('--magnitudes', type=float, nargs='+', default=[9.8],
+                        help='gravity magnitudes paired with every swept direction')
     parser.add_argument('--handles', type=int, default=8, help='number of handles, including the '
                                                                'constant one')
     parser.add_argument('--layer-width', type=int, default=64)
@@ -502,8 +604,13 @@ def main():
     dtype = torch.float32 if args.float32 else torch.float64
     torch.manual_seed(args.seed)
 
-    trajectory = _ensure_beam_data(tuple(args.resolution), args.frames, args.device, dtype)
-    dataset = TrajectoryDataset([trajectory], device=args.device, dtype=dtype)
+    if args.scenarios > 0:
+        trajectories = _ensure_scenario_data(args.scenarios, tuple(args.magnitudes),
+                                             tuple(args.resolution), args.frames, args.device,
+                                             dtype)
+    else:
+        trajectories = [_ensure_beam_data(tuple(args.resolution), args.frames, args.device, dtype)]
+    dataset = TrajectoryDataset(trajectories, device=args.device, dtype=dtype)
 
     rest = dataset.rest_positions
 
@@ -521,10 +628,15 @@ def main():
         return SimInLoopTrainer(skinning_mod, dataset, config, generator=generator)
 
     reference = make_trainer()
-    print(f'{dataset.num_frames()} frames, {rest.shape[0]} nodes, '
-          f'{args.handles} handles ({12 * args.handles} reduced dofs), '
-          f'{args.num_qp} quadrature points ({reference.num_pinned} pinned)')
-    initial = reference.evaluate(dataset.eval_window(args.horizon))
+    num_windows = len(dataset.all_train_windows(args.horizon))
+    print(f'{dataset.num_trajectories} scenario(s), {dataset.num_frames()} frames each, '
+          f'{rest.shape[0]} nodes, {args.handles} handles ({12 * args.handles} reduced dofs), '
+          f'{args.num_qp} quadrature points ({reference.num_pinned} pinned), '
+          f'{num_windows} training windows at horizon {args.horizon}')
+    if dataset.num_trajectories > 1:
+        for line in dataset.scenario_summary():
+            print(f'  {line}')
+    initial = reference.evaluate_all(args.horizon)
     print(f"at initialization: held-out rollout mean {initial['rollout_mean']:.4e} m, "
           f"projection floor {initial['projection_mean']:.4e} m, "
           f"motion scale {initial['target_max']:.4e} m")
@@ -535,17 +647,18 @@ def main():
         if args.pretrain > 0:
             trainer.pretrain_projection(args.pretrain)
         trainer.train(args.steps, horizon=args.horizon)
-        results['sim_in_loop'] = trainer.evaluate(dataset.eval_window(args.horizon))
+        results['sim_in_loop'] = trainer.evaluate_all(args.horizon)
 
     if args.mode in ('data_free', 'both'):
         trainer = make_trainer()
         trainer.train_data_free(args.data_free_steps, eval_horizon=args.horizon)
-        results['data_free'] = trainer.evaluate(dataset.eval_window(args.horizon))
+        results['data_free'] = trainer.evaluate_all(args.horizon)
 
-    print(f'\n{"mode":<14} {"rollout mean":>14} {"rollout max":>14} {"projection floor":>18}')
+    print(f'\n{"mode":<14} {"rollout mean":>14} {"rollout max":>14} {"worst scenario":>16} '
+          f'{"projection floor":>18}')
     for name, metrics in results.items():
         print(f"{name:<14} {metrics['rollout_mean']:14.4e} {metrics['rollout_max']:14.4e} "
-              f"{metrics['projection_mean']:18.4e}")
+              f"{metrics['worst_rollout_mean']:16.4e} {metrics['projection_mean']:18.4e}")
     print(f"{'(motion scale)':<14} {initial['target_max']:14.4e}")
 
 

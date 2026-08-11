@@ -27,6 +27,8 @@ The Warp scene remains the fast forward path and the correctness oracle; the equ
 ``tests/python/kaolin/experimental/simplicits_diffsim/`` compare the two layer by layer.
 """
 
+import copy
+
 import torch
 
 from kaolin.physics.utils.torch_utilities import hess_reduction
@@ -103,6 +105,24 @@ class ReducedModel:
     def num_reduced_dofs(self):
         r"""int: Size of the reduced coordinate vector, :math:`12 \times \text{num_handles}`."""
         return self.lbs.shape[1]
+
+    def with_pt_forces(self, pt_forces):
+        r"""A view of this model carrying a different set of point-wise forces.
+
+        :math:`B`, :math:`\partial F/\partial z` and :math:`B^T M B` depend on the skinning field
+        and the masses, never on the loads, so several load scenarios can share one assembly and
+        one network evaluation. The returned model **shares** those tensors -- including their
+        autograd history -- so a gradient taken through it still reaches :math:`\theta`.
+
+        Args:
+            pt_forces (list): Point-wise potentials from :mod:`.forces`.
+
+        Returns:
+            ReducedModel: A shallow copy with ``pt_forces`` replaced.
+        """
+        other = copy.copy(self)
+        other.pt_forces = list(pt_forces)
+        return other
 
     def zeros(self):
         r"""Zero reduced coordinate vector (the rest state).

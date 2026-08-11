@@ -26,6 +26,17 @@ window is used.
 Train/eval splits are by *frame range* rather than at random: a random split would let the model
 interpolate between neighbouring frames it has already seen, which says nothing about whether the
 learned dynamics extrapolate.
+
+A dataset holds several trajectories of *one* object under different loads. That is the only way to
+scale training data for a Simplicits field: :math:`W_\theta` maps a point of this object's bounding
+box to this object's handle weights, so it is per-object by construction and more data means more
+scenarios and more frames, not more geometries.
+
+Which controls may vary across those scenarios is enforced rather than assumed. ``gravity`` may
+differ; the time step, material and pin predicate may not, because the trainer bakes them into the
+quadrature weights and the reduced mass matrix once. Without that check a dataset of
+different-material scenarios would train every one of them against trajectory 0's material and
+report a plausible-looking loss.
 """
 
 import torch
@@ -36,6 +47,15 @@ __all__ = [
     'TrajectoryWindow',
     'TrajectoryDataset',
 ]
+
+# Controls every trajectory in a dataset must agree on, because the trainer resolves them once into
+# quadrature volumes, Lame parameters, masses and pin indices that are shared across all scenarios.
+_SHARED_CONTROL_KEYS = ('timestep', 'youngs_modulus', 'poisson_ratio', 'density', 'pin_axis',
+                        'pin_threshold')
+
+# Controls that are allowed to differ per scenario. Each one costs only a force rebuild, never a
+# rebuild of B, dF/dz or B^T M B, which is what makes many scenarios per step affordable.
+_SCENARIO_CONTROL_KEYS = ('gravity',)
 
 
 class TrajectoryWindow:
@@ -128,9 +148,17 @@ class TrajectoryDataset:
         self.total_volume = first['total_volume']
         self.controls = first['controls']
         self.timestep = float(self.controls['timestep'])
-        for other in self.trajectories[1:]:
+        for index, other in enumerate(self.trajectories[1:], start=1):
             if not torch.equal(other['rest_positions'], self.rest_positions):
                 raise ValueError('all trajectories must share one rest configuration')
+            for key in _SHARED_CONTROL_KEYS:
+                mine, theirs = self.controls.get(key), other['controls'].get(key)
+                if mine != theirs:
+                    raise ValueError(
+                        f'trajectory {index} has {key}={theirs!r} but trajectory 0 has {mine!r}; '
+                        f'{_SHARED_CONTROL_KEYS} must match across a dataset because the trainer '
+                        f'resolves them once. Varying {key} needs a separate dataset, or a trainer '
+                        f'that rebuilds the reduced mass matrix per scenario.')
 
     @classmethod
     def from_files(cls, paths, device=None, dtype=torch.float64, train_fraction=0.7):
@@ -152,6 +180,49 @@ class TrajectoryDataset:
             paths = [paths]
         return cls([load_trajectory(p) for p in paths], device=device, dtype=dtype,
                    train_fraction=train_fraction)
+
+    @property
+    def num_trajectories(self):
+        r"""int: Number of scenarios in the dataset."""
+        return len(self.trajectories)
+
+    def controls_at(self, trajectory_index=0):
+        r"""Replay controls for one scenario.
+
+        Args:
+            trajectory_index (int, optional): Which trajectory. Default: 0.
+
+        Returns:
+            dict: The trajectory's ``controls``.
+        """
+        return self.trajectories[trajectory_index]['controls']
+
+    def gravity_at(self, trajectory_index=0):
+        r"""Gravity vector of one scenario, as a tensor on the dataset's device and dtype.
+
+        Args:
+            trajectory_index (int, optional): Which trajectory. Default: 0.
+
+        Returns:
+            torch.Tensor: Acceleration vector, of shape :math:`(3,)` (in :math:`m/s^2`).
+        """
+        return torch.as_tensor(self.controls_at(trajectory_index)['gravity'],
+                               device=self.rest_positions.device, dtype=self.rest_positions.dtype)
+
+    def scenario_summary(self):
+        r"""One-line description per scenario, for logging which loads are in the pool.
+
+        Returns:
+            list of str: Descriptions, one per trajectory.
+        """
+        lines = []
+        for index in range(self.num_trajectories):
+            gravity = self.gravity_at(index)
+            direction = gravity / gravity.norm().clamp_min(1e-12)
+            lines.append(f'scenario {index:2d}: |g| {float(gravity.norm()):5.2f} '
+                         f"dir ({direction[0]:+.2f}, {direction[1]:+.2f}, {direction[2]:+.2f})  "
+                         f'{self.num_frames(index)} frames')
+        return lines
 
     def num_frames(self, trajectory_index=0):
         r"""Number of simulated frames, excluding the rest frame.
@@ -239,6 +310,61 @@ class TrajectoryDataset:
             TrajectoryWindow: The window.
         """
         return self.window(self.num_frames(trajectory_index), 0, trajectory_index)
+
+    def all_train_windows(self, horizon, stride=1):
+        r"""Training-range windows from *every* scenario, pooled.
+
+        This is the pool trajectory training should draw from: with one scenario a field can fit
+        the single deformation family that trajectory visits, and does so well before it has
+        learned a basis for the object.
+
+        Args:
+            horizon (int): Frames per window.
+            stride (int, optional): Step between window starts. Default: 1.
+
+        Returns:
+            list of TrajectoryWindow: Windows from all trajectories, in scenario order.
+        """
+        pooled = []
+        for index in range(self.num_trajectories):
+            pooled.extend(self.train_windows(horizon, stride=stride, trajectory_index=index))
+        return pooled
+
+    def all_eval_windows(self, horizon=None):
+        r"""One held-out window per scenario.
+
+        Args:
+            horizon (int, optional): Frames to predict. Default: everything after each split.
+
+        Returns:
+            list of TrajectoryWindow: Held-out windows, one per trajectory.
+        """
+        return [self.eval_window(horizon, index) for index in range(self.num_trajectories)]
+
+    def all_full_windows(self):
+        r"""Every scenario as one window starting from rest.
+
+        Returns:
+            list of TrajectoryWindow: Full-trajectory windows, one per trajectory.
+        """
+        return [self.full_window(index) for index in range(self.num_trajectories)]
+
+    def train_snapshots(self):
+        r"""Full-order displacements over every scenario's training range, stacked.
+
+        Used by snapshot pretraining and by the POD baseline, both of which want *all* the shapes
+        the basis must represent rather than one trajectory's worth.
+
+        Returns:
+            torch.Tensor: Displacements, of shape
+            :math:`(\sum_s \text{split}_s, \text{num_nodes}, 3)`.
+        """
+        chunks = []
+        for index in range(self.num_trajectories):
+            data = self.trajectories[index]
+            split = self.split_frame(index)
+            chunks.append(data['positions'][1:split + 1] - data['rest_positions'])
+        return torch.cat(chunks, dim=0)
 
     def quadrature_points(self, num_points, mode='random', generator=None, trajectory_index=0):
         r"""Quadrature points and their integration volumes for the reduced model.

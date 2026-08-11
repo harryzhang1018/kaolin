@@ -34,6 +34,7 @@ Run as::
 """
 
 import argparse
+import math
 import os
 import time
 
@@ -44,6 +45,9 @@ from .fem_hex import FullOrderNeohookeanSolver, HexGrid
 __all__ = [
     'BEAM_SCENARIO',
     'generate_trajectory',
+    'gravity_sweep_scenarios',
+    'generate_scenario_set',
+    'scenario_set_paths',
     'load_trajectory',
     'validate_against_reference',
 ]
@@ -147,6 +151,111 @@ def generate_trajectory(num_frames=100, resolution=None, device='cuda', dtype=to
     }
 
 
+def _fibonacci_directions(count):
+    """``count`` well-spread unit vectors on the sphere, deterministically."""
+    indices = torch.arange(count, dtype=torch.float64) + 0.5
+    polar = torch.acos(1.0 - 2.0 * indices / count)
+    azimuth = math.pi * (1.0 + 5.0 ** 0.5) * indices
+    return torch.stack([torch.sin(polar) * torch.cos(azimuth),
+                        torch.cos(polar),
+                        torch.sin(polar) * torch.sin(azimuth)], dim=-1)
+
+
+def gravity_sweep_scenarios(num_directions=12, magnitudes=(9.8,)):
+    r"""Scenario overrides that rotate and rescale gravity.
+
+    The cheapest way to put genuinely different deformations in the training pool: gravity is a
+    body force, so it changes only the load term, leaving the material, the time step and the pin
+    predicate -- and therefore :math:`B^T M B` and the quadrature weights -- untouched. Directions
+    come from a Fibonacci spiral so they are spread over the whole sphere rather than clustered:
+    for a beam slender along :math:`x`, transverse directions bend it, axial ones stretch it, and
+    the oblique majority twist it, none of which the single :math:`(0, 9.8, 0)` trajectory contains.
+
+    Magnitude matters independently of direction, because it sets how far into the nonlinear
+    regime the beam goes.
+
+    Args:
+        num_directions (int, optional): Directions on the sphere. Default: 12.
+        magnitudes (sequence of float, optional): Gravity magnitudes to pair with every direction
+            (in :math:`m/s^2`). Default: ``(9.8,)``.
+
+    Returns:
+        list of dict: ``{'gravity': (gx, gy, gz)}`` overrides for :func:`generate_trajectory`,
+        ``num_directions * len(magnitudes)`` of them.
+    """
+    directions = _fibonacci_directions(num_directions)
+    return [{'gravity': tuple(float(component) * float(magnitude) for component in direction)}
+            for magnitude in magnitudes for direction in directions]
+
+
+def scenario_set_paths(num_scenarios, resolution, num_frames, out_dir='data'):
+    r"""Paths :func:`generate_scenario_set` writes to, without generating anything.
+
+    Args:
+        num_scenarios (int): How many scenarios.
+        resolution (sequence of int): Elements per axis.
+        num_frames (int): Frames per trajectory.
+        out_dir (str, optional): Directory. Default: ``'data'``.
+
+    Returns:
+        list of str: The paths, in scenario order.
+    """
+    tag = 'x'.join(str(int(r)) for r in resolution)
+    return [os.path.join(out_dir, f'fom_beam_{tag}_{num_frames}frames_scenario{i:02d}.pth')
+            for i in range(num_scenarios)]
+
+
+def generate_scenario_set(scenarios, num_frames=60, resolution=None, out_dir='data', device='cuda',
+                          dtype=torch.float64, linear_solver='auto', tolerance=1e-9, overwrite=False,
+                          verbose=True, **kwargs):
+    r"""Generate and cache one full-order trajectory per scenario.
+
+    Existing files are reused unless ``overwrite`` is set, so an interrupted sweep resumes.
+
+    Args:
+        scenarios (list of dict): Overrides for :data:`BEAM_SCENARIO`, e.g. from
+            :func:`gravity_sweep_scenarios`.
+        num_frames (int, optional): Frames per trajectory. Default: 60.
+        resolution (sequence of int, optional): Elements per axis. Default: the scenario's.
+        out_dir (str, optional): Output directory. Default: ``'data'``.
+        device (str or torch.device, optional): Device. Default: ``'cuda'``.
+        dtype (torch.dtype, optional): Precision. Default: ``torch.float64``.
+        linear_solver (str, optional): Full-order linear solver. Default: ``'auto'``.
+        tolerance (float, optional): Newton stopping tolerance. Default: 1e-9.
+        overwrite (bool, optional): Regenerate trajectories already on disk. Default: False.
+        verbose (bool, optional): Print progress. Default: True.
+        **kwargs: Forwarded to :func:`generate_trajectory`.
+
+    Returns:
+        list of str: Paths written or reused, in scenario order.
+    """
+    grid_resolution = tuple(int(r) for r in (resolution or BEAM_SCENARIO['resolution']))
+    paths = scenario_set_paths(len(scenarios), grid_resolution, num_frames, out_dir)
+    os.makedirs(os.path.abspath(out_dir), exist_ok=True)
+    start = time.time()
+
+    for index, (scenario, path) in enumerate(zip(scenarios, paths)):
+        if os.path.exists(path) and not overwrite:
+            if verbose:
+                print(f'[{index + 1}/{len(paths)}] {path} exists, reusing')
+            continue
+        trajectory = generate_trajectory(num_frames=num_frames, resolution=grid_resolution,
+                                        device=device, dtype=dtype, verbose=False,
+                                        scenario=scenario, linear_solver=linear_solver,
+                                        tolerance=tolerance, **kwargs)
+        torch.save(trajectory, path)
+        if verbose:
+            gravity = trajectory['controls']['gravity']
+            drift = (trajectory['positions'][-1] - trajectory['rest_positions']).norm(dim=-1).max()
+            print(f'[{index + 1}/{len(paths)}] g = '
+                  f'({gravity[0]:+6.2f}, {gravity[1]:+6.2f}, {gravity[2]:+6.2f})  '
+                  f'max displacement {float(drift):.4f} m  -> {path}')
+
+    if verbose:
+        print(f'{len(paths)} scenarios ready in {time.time() - start:.1f}s')
+    return paths
+
+
 def load_trajectory(path, device=None, dtype=None):
     r"""Load a trajectory written by :func:`generate_trajectory`.
 
@@ -234,6 +343,13 @@ def main():
                         help='linear solver for the full-order Newton steps')
     parser.add_argument('--newton-tol', type=float, default=1e-9,
                         help='relative Newton residual at which a step is considered converged')
+    parser.add_argument('--sweep-directions', type=int, default=0,
+                        help='generate a gravity-direction sweep of this many directions instead '
+                             'of a single trajectory')
+    parser.add_argument('--sweep-magnitudes', type=float, nargs='+', default=[9.8],
+                        help='gravity magnitudes paired with every swept direction')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='regenerate sweep trajectories already on disk')
     args = parser.parse_args()
 
     dtype = torch.float32 if args.float32 else torch.float64
@@ -246,6 +362,14 @@ def main():
     resolution = args.resolution
     if resolution is None and args.coarse:
         resolution = COARSE_RESOLUTION
+
+    if args.sweep_directions > 0:
+        scenarios = gravity_sweep_scenarios(args.sweep_directions, tuple(args.sweep_magnitudes))
+        generate_scenario_set(scenarios, num_frames=args.frames, resolution=resolution,
+                              out_dir=os.path.dirname(args.out) if args.out else 'data',
+                              device=args.device, dtype=dtype, linear_solver=args.linear_solver,
+                              tolerance=args.newton_tol, overwrite=args.overwrite)
+        return
     trajectory = generate_trajectory(num_frames=args.frames, resolution=resolution,
                                      device=args.device, dtype=dtype,
                                      linear_solver=args.linear_solver,
