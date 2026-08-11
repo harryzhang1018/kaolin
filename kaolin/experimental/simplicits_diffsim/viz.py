@@ -30,6 +30,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from matplotlib.animation import FFMpegWriter, PillowWriter  # noqa: E402
+from matplotlib.cm import ScalarMappable  # noqa: E402
+from matplotlib.colors import Normalize  # noqa: E402
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # noqa: E402
 
 __all__ = [
@@ -63,7 +65,8 @@ def _permutation_for(up_axis):
 
 
 def render_trajectory(path, positions, faces, reference=None, title='', fps=15, dpi=130,
-                      elev=8, azim=-88, limits=None, dt=None, up_axis=1, labels='xyz'):
+                      elev=8, azim=-88, limits=None, dt=None, up_axis=1, labels='xyz',
+                      style='ghost', error_max=None):
     r"""Write a trajectory to an mp4 (or gif, if ffmpeg is unavailable).
 
     Args:
@@ -71,8 +74,18 @@ def render_trajectory(path, positions, faces, reference=None, title='', fps=15, 
         positions (torch.Tensor): Positions per frame, of shape
             :math:`(\text{num_frames}, \text{num_nodes}, 3)`.
         faces (torch.Tensor): Surface triangles, of shape :math:`(\text{num_triangles}, 3)`.
-        reference (torch.Tensor, optional): Full-order positions to draw as a translucent ghost and
+        reference (torch.Tensor, optional): Full-order positions to draw behind ``positions`` and
             to measure against, same shape as ``positions``. Default: None.
+        style (str, optional): How the two trajectories are drawn. ``'ghost'`` draws the prediction
+            solid with the reference as a translucent body behind it, so a visible disagreement
+            shows as reference peeking out from under the prediction. ``'error'`` draws the
+            prediction solid, coloured by its per-vertex distance from the reference, with a colour
+            bar in metres. Prefer ``'error'`` once the two agree to a small fraction of the object's
+            thickness: any overlay of two coincident bodies is uninformative exactly when the match
+            is good, and matplotlib does not depth-sort between 3D collections reliably enough for a
+            wireframe-over-solid variant to be worth having. Default: ``'ghost'``.
+        error_max (float, optional): Upper end of the ``'error'`` colour scale (in :math:`m`). Fix
+            it across a set of videos to make them comparable. Default: None (per-video maximum).
         title (str, optional): Title prefix. Default: ''.
         fps (int, optional): Frames per second. Default: 15.
         dpi (int, optional): Output resolution. Default: 130.
@@ -105,16 +118,37 @@ def render_trajectory(path, positions, faces, reference=None, title='', fps=15, 
 
     figure = plt.figure(figsize=(9, 5.0))
     axes = figure.add_subplot(111, projection='3d')
-    figure.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.88)
+    # A colour bar needs room for its tick labels, which sit outside the axes.
+    figure.subplots_adjust(left=0.02, right=0.86 if style == 'error' else 0.98,
+                           bottom=0.02, top=0.88)
 
-    surface = Poly3DCollection(positions[0][faces], facecolor=_SURFACE_COLOR, edgecolor='#1b3a63',
-                               linewidths=0.25, alpha=0.97)
-    axes.add_collection3d(surface)
+    if style not in ('ghost', 'error'):
+        raise ValueError(f"style must be 'ghost' or 'error', got {style!r}")
+    if style == 'error' and reference is None:
+        raise ValueError("style='error' needs a reference to measure against")
+
     ghost = None
-    if reference is not None:
-        ghost = Poly3DCollection(reference[0][faces], facecolor=_GHOST_COLOR, edgecolor='none',
-                                 alpha=0.30)
-        axes.add_collection3d(ghost)
+    face_error = None
+    if style == 'error':
+        vertex_error = np.linalg.norm(positions - reference, axis=-1)
+        face_error = vertex_error[:, faces].mean(axis=-1)
+        scale = Normalize(vmin=0.0, vmax=error_max or float(face_error.max()))
+        colormap = matplotlib.colormaps['viridis']
+        surface = Poly3DCollection(positions[0][faces],
+                                   facecolors=colormap(scale(face_error[0])), edgecolor='none')
+        axes.add_collection3d(surface)
+        bar = figure.colorbar(ScalarMappable(norm=scale, cmap=colormap), ax=axes, fraction=0.028,
+                              pad=0.0, shrink=0.66)
+        bar.set_label('distance from full-order FEM  (m)', fontsize=9)
+        bar.ax.tick_params(labelsize=8)
+    else:
+        surface = Poly3DCollection(positions[0][faces], facecolor=_SURFACE_COLOR,
+                                   edgecolor='#1b3a63', linewidths=0.25, alpha=0.97)
+        axes.add_collection3d(surface)
+        if reference is not None:
+            ghost = Poly3DCollection(reference[0][faces], facecolor=_GHOST_COLOR,
+                                     edgecolor='none', alpha=0.30)
+            axes.add_collection3d(ghost)
 
     axes.set_xlim(lower[0], upper[0])
     axes.set_ylim(lower[1], upper[1])
@@ -130,13 +164,16 @@ def render_trajectory(path, positions, faces, reference=None, title='', fps=15, 
 
     def update(frame):
         surface.set_verts(positions[frame][faces])
+        if face_error is not None:
+            surface.set_facecolor(colormap(scale(face_error[frame])))
         label = title
         if dt is not None:
             label = f'{label}   t = {frame * dt:5.2f} s'
-        if reference is not None:
+        if ghost is not None:
             ghost.set_verts(reference[frame][faces])
+        if reference is not None:
             error = np.linalg.norm(positions[frame] - reference[frame], axis=-1)
-            label = f'{label}   error mean {error.mean():.3f} m  max {error.max():.3f} m'
+            label = f'{label}   error mean {error.mean():.4f} m  max {error.max():.4f} m'
         text.set_text(label)
         return surface, text
 
